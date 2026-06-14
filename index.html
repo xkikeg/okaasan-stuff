@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ぷみのお母さんの風力発電メンテナンス</title>
+<style>
+  html,body{margin:0;height:100%;background:#11202b;overflow:hidden;
+    font-family:'Hiragino Maru Gothic Pro','Yu Gothic','Meiryo',sans-serif;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{background:#11202b;max-width:100%;max-height:100%;
+    box-shadow:0 10px 40px rgba(0,0,0,.5);border-radius:6px;
+    image-rendering:auto;cursor:pointer;touch-action:none;}
+  #loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    color:#bfe3c0;font-size:20px;letter-spacing:2px;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1376" height="768"></canvas></div>
+<div id="loading">よみこみちゅう…</div>
+<script>
+(() => {
+  const CW = 1376, CH = 768;
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // ---------- assets ----------
+  const SRC = {
+    bg:     'assets/background.png',
+    front:  'assets/mother_front.png',
+    back:   'assets/mother_back.png',
+    rotor:  'assets/turbine_rotor.png',
+    tower:  'assets/turbine_tower.png',
+  };
+  const IMG = {};
+  let loaded = 0, total = Object.keys(SRC).length;
+  for (const k in SRC) {
+    const im = new Image();
+    im.onload = () => { if (++loaded === total) start(); };
+    im.onerror = () => { document.getElementById('loading').textContent =
+      '画像の読み込みに失敗: ' + SRC[k]; };
+    im.src = SRC[k];
+    IMG[k] = im;
+  }
+
+  // ---------- helpers ----------
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const TAU = Math.PI * 2;
+
+  // tower image aspect (width / height) from the asset
+  const TOWER_AR = 396 / 2885;
+
+  // ---------- turbine geometry ----------
+  // each turbine: x,y = base (foot) on the map. total visual height -> derived parts.
+  function turbineParts(t) {
+    const h = t.h;                 // total visual height
+    const S = h / 1.48;            // tower pole height
+    const rotorD = S * 0.98;       // rotor displayed diameter
+    const towerW = S * TOWER_AR;
+    const hubY = t.y - S;          // hub sits S above the base
+    return { S, rotorD, towerW, hubY, hx: t.x };
+  }
+
+  // ---------- game state ----------
+  let scene = 'title';      // 'title' | 'playing' | 'result'
+  let mode = 'relax';       // 'challenge' | 'relax'
+  let muted = false;
+
+  const turbines = [];
+  let mother = null;
+  const particles = [];
+  let score = 0;
+  let timeLeft = 0;         // challenge
+  let stopTimer = 0;        // countdown to next breakdown
+  let elapsed = 0;
+
+  // foot positions on the 1376x768 map (avoiding river / lake / peaks)
+  const SPOTS = [
+    [198, 452], [352, 612], [470, 372], [556, 672],
+    [905, 352], [1018, 478], [1182, 318], [1196, 560],
+  ];
+
+  function newTurbine(x, y) {
+    const depth = y / CH;                 // 0 (far) .. 1 (near)
+    const h = 178 + depth * 74;           // nearer = taller
+    const dir = Math.random() < 0.5 ? 1 : -1;
+    return {
+      x, y, h,
+      baseSpin: dir * rand(1.7, 2.5),
+      angle: rand(0, TAU),
+      angVel: dir * rand(1.7, 2.5),
+      state: 'spinning',                  // 'spinning' | 'stopped'
+      wobble: 0,
+    };
+  }
+
+  function resetGame(m) {
+    mode = m;
+    turbines.length = 0;
+    particles.length = 0;
+    for (const [x, y] of SPOTS) turbines.push(newTurbine(x, y));
+    score = 0;
+    elapsed = 0;
+    timeLeft = 60;
+    stopTimer = mode === 'challenge' ? 2.2 : 3.5;
+    mother = {
+      x: CW / 2, y: 712,
+      tx: CW / 2, ty: 712,
+      facing: 1, moving: false, goingUp: false,
+      state: 'idle',                       // 'idle' | 'walk' | 'wave'
+      waveT: 0, waveTarget: null, didGust: false,
+      h: 198,
+    };
+    scene = 'playing';
+  }
+
+  // ---------- audio (WebAudio, no files) ----------
+  let actx = null;
+  function ac() { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); return actx; }
+  function whoosh() {
+    if (muted) return;
+    const a = ac(), t = a.currentTime;
+    const buf = a.createBuffer(1, a.sampleRate * 0.6, a.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length);
+    const src = a.createBufferSource(); src.buffer = buf;
+    const f = a.createBiquadFilter(); f.type = 'bandpass';
+    f.frequency.setValueAtTime(400, t); f.frequency.exponentialRampToValueAtTime(2200, t + 0.5);
+    f.Q.value = 0.8;
+    const g = a.createGain(); g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.5, t + 0.08);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.58);
+    src.connect(f); f.connect(g); g.connect(a.destination); src.start(t); src.stop(t + 0.6);
+  }
+  function ding() {
+    if (muted) return;
+    const a = ac(), t = a.currentTime;
+    [659, 988].forEach((fr, i) => {
+      const o = a.createOscillator(), g = a.createGain();
+      o.type = 'sine'; o.frequency.value = fr;
+      g.gain.setValueAtTime(0.0001, t + i * 0.09);
+      g.gain.exponentialRampToValueAtTime(0.25, t + i * 0.09 + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + i * 0.09 + 0.4);
+      o.connect(g); g.connect(a.destination); o.start(t + i * 0.09); o.stop(t + i * 0.09 + 0.45);
+    });
+  }
+
+  // ---------- input ----------
+  function canvasPos(e) {
+    const r = canvas.getBoundingClientRect();
+    const px = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+    const py = (e.touches ? e.touches[0].clientY : e.clientY) - r.top;
+    return { x: px * (CW / r.width), y: py * (CH / r.height) };
+  }
+  function inRect(p, r) { return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+
+  // UI button rects
+  const BTN = {
+    challenge: { x: CW/2 - 250, y: 452, w: 230, h: 78 },
+    relax:     { x: CW/2 + 20,  y: 452, w: 230, h: 78 },
+    retry:     { x: CW/2 - 250, y: 470, w: 230, h: 72 },
+    toTitle:   { x: CW/2 + 20,  y: 470, w: 230, h: 72 },
+    back:      { x: 18, y: 18, w: 116, h: 44 },
+    mute:      { x: CW - 62, y: 18, w: 44, h: 44 },
+  };
+
+  function onTap(e) {
+    e.preventDefault();
+    const p = canvasPos(e);
+    if (actx) actx.resume();
+
+    if (scene === 'title') {
+      if (inRect(p, BTN.challenge)) { resetGame('challenge'); return; }
+      if (inRect(p, BTN.relax))     { resetGame('relax'); return; }
+      return;
+    }
+    if (scene === 'result') {
+      if (inRect(p, BTN.retry))   { resetGame(mode); return; }
+      if (inRect(p, BTN.toTitle)) { scene = 'title'; return; }
+      return;
+    }
+    if (scene === 'playing') {
+      if (inRect(p, BTN.back)) { scene = 'title'; return; }
+      if (inRect(p, BTN.mute)) { muted = !muted; return; }
+      // walk target = clicked point (clamped to ground band)
+      mother.tx = clamp(p.x, 40, CW - 40);
+      mother.ty = clamp(p.y, 250, CH - 26);
+    }
+  }
+  canvas.addEventListener('mousedown', onTap);
+  canvas.addEventListener('touchstart', onTap, { passive: false });
+
+  // ---------- breakdown logic ----------
+  function triggerBreakdown() {
+    const running = turbines.filter(t => t.state === 'spinning');
+    if (!running.length) return;
+    const t = running[(Math.random() * running.length) | 0];
+    t.state = 'stopped';
+  }
+
+  // ---------- wind gust / fix ----------
+  function spawnGust(fromX, fromY, hub) {
+    const ang = Math.atan2(hub.y - fromY, hub.x - fromX);
+    const dist = Math.hypot(hub.x - fromX, hub.y - fromY);
+    const speed = dist / 0.42;
+    for (let i = 0; i < 80; i++) {
+      const a = ang + rand(-0.6, 0.6);
+      const sp = speed * rand(0.7, 1.2);
+      const r = Math.random();
+      const type = r < 0.42 ? 'line' : (r < 0.74 ? 'swirl' : 'leaf');
+      particles.push({
+        x: fromX + rand(-14, 14), y: fromY + rand(-14, 14),
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        life: rand(0.5, 0.85), max: 0.85,
+        type, rot: rand(0, TAU), vr: rand(-9, 9),
+        curl: rand(-4, 4), sz: rand(10, 22),
+        hue: type === 'leaf' ? (Math.random() < 0.5 ? '#6ab04c' : '#caa24a') : null,
+      });
+    }
+    whoosh();
+  }
+
+  function fixTurbine(t) {
+    if (t.state !== 'stopped') return;
+    t.state = 'spinning';
+    t.angVel = (t.baseSpin >= 0 ? 1 : -1) * 9.5;  // spin-up burst
+    // expanding wind ring at the hub
+    const p = turbineParts(t);
+    particles.push({ type: 'ring', x: p.hx, y: p.hubY, life: 0.6, max: 0.6, sz: p.rotorD * 0.18, grow: p.rotorD * 1.7 });
+    score++;
+    ding();
+  }
+
+  // ---------- update ----------
+  function update(dt) {
+    if (scene !== 'playing') return;
+    elapsed += dt;
+
+    // timers
+    if (mode === 'challenge') {
+      timeLeft -= dt;
+      if (timeLeft <= 0) { timeLeft = 0; scene = 'result'; return; }
+    }
+    stopTimer -= dt;
+    if (stopTimer <= 0) {
+      triggerBreakdown();
+      let base = mode === 'challenge'
+        ? clamp(4.2 - elapsed * 0.05, 1.4, 4.2)   // ramps up over time
+        : rand(5.5, 8.5);
+      stopTimer = base * rand(0.8, 1.2);
+    }
+
+    // turbine spin physics
+    for (const t of turbines) {
+      const target = t.state === 'spinning' ? t.baseSpin : 0;
+      const k = t.state === 'spinning' ? 1.4 : 2.2;
+      t.angVel += (target - t.angVel) * clamp(dt * k, 0, 1);
+      t.angle += t.angVel * dt;
+      if (t.state === 'stopped') t.wobble = Math.sin(elapsed * 3) * 0.025;
+      else t.wobble = 0;
+    }
+
+    // mother movement
+    const m = mother;
+    if (m.state !== 'wave') {
+      const dx = m.tx - m.x, dy = m.ty - m.y;
+      const d = Math.hypot(dx, dy);
+      const spd = 168;
+      if (d > 4) {
+        const step = Math.min(d, spd * dt);
+        m.x += dx / d * step; m.y += dy / d * step;
+        m.moving = true;
+        m.goingUp = dy < -1;
+        if (Math.abs(dx) > 2) m.facing = dx > 0 ? 1 : -1;
+        m.state = 'walk';
+      } else {
+        m.moving = false;
+        m.state = 'idle';
+      }
+      // arrival near a stopped turbine -> start waving
+      if (!m.moving) {
+        let best = null, bd = 1e9;
+        for (const t of turbines) {
+          if (t.state !== 'stopped') continue;
+          const dd = Math.hypot(t.x - m.x, t.y - m.y);
+          if (dd < 118 && dd < bd) { bd = dd; best = t; }
+        }
+        if (best) {
+          m.state = 'wave'; m.waveT = 0; m.waveTarget = best; m.didGust = false;
+          m.facing = best.x >= m.x ? 1 : -1;
+        }
+      }
+    } else {
+      // waving
+      m.waveT += dt;
+      if (!m.didGust && m.waveT > 0.22) {
+        m.didGust = true;
+        const t = m.waveTarget;
+        if (t && t.state === 'stopped') {
+          const p = turbineParts(t);
+          const hand = { x: m.x + m.facing * m.h * 0.30, y: m.y - m.h * 0.60 };
+          spawnGust(hand.x, hand.y, { x: p.hx, y: p.hubY });
+        }
+      }
+      if (m.waveT > 0.5 && m.waveTarget) { fixTurbine(m.waveTarget); m.waveTarget = null; }
+      if (m.waveT > 0.95) { m.state = 'idle'; m.moving = false; }
+    }
+
+    // particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      if (p.type === 'ring') {
+        p.sz += p.grow * dt;
+        p.life -= dt;
+      } else {
+        // curl the velocity for a swirling feel
+        const a = Math.atan2(p.vy, p.vx) + p.curl * dt;
+        const sp = Math.hypot(p.vx, p.vy) * (1 - dt * 1.1);
+        p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp;
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        p.rot += p.vr * dt;
+        p.life -= dt;
+      }
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  // ---------- draw ----------
+  function drawTurbine(t) {
+    const { S, rotorD, towerW, hubY, hx } = turbineParts(t);
+    // tower (slight tuck under the hub to hide the seam)
+    ctx.save();
+    if (t.wobble) { ctx.translate(hx, hubY); ctx.rotate(t.wobble); ctx.translate(-hx, -hubY); }
+    ctx.drawImage(IMG.tower, hx - towerW / 2, hubY - S * 0.02, towerW, S * 1.0);
+    // rotor
+    ctx.translate(hx, hubY); ctx.rotate(t.angle);
+    ctx.drawImage(IMG.rotor, -rotorD / 2, -rotorD / 2, rotorD, rotorD);
+    ctx.restore();
+
+    // stopped indicator
+    if (t.state === 'stopped') {
+      const by = hubY - rotorD * 0.52 - 6;
+      const bob = Math.sin(elapsed * 4) * 3;
+      ctx.save();
+      ctx.translate(hx, by + bob);
+      ctx.fillStyle = '#ff5252';
+      ctx.beginPath();
+      roundRect(-15, -34, 30, 30, 8); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-6, -6); ctx.lineTo(6, -6); ctx.lineTo(0, 4); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 22px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('!', 0, -19);
+      ctx.restore();
+    }
+  }
+
+  function drawMother() {
+    const m = mother;
+    const img = (m.state === 'walk' && m.goingUp) ? IMG.back : IMG.front;
+    const h = m.h, w = h * (img.width / img.height);
+    let bob = 0, tilt = 0;
+    if (m.state === 'walk') bob = Math.abs(Math.sin(elapsed * 8)) * 5;
+    if (m.state === 'wave') tilt = Math.sin(m.waveT * 22) * 0.12;
+    ctx.save();
+    ctx.translate(m.x, m.y - bob);
+    ctx.rotate(tilt);
+    ctx.scale(m.facing, 1);
+    ctx.drawImage(img, -w / 2, -h, w, h);
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      const al = clamp(p.life / p.max, 0, 1);
+      if (p.type === 'ring') {
+        ctx.save();
+        ctx.globalAlpha = al * 0.6;
+        ctx.strokeStyle = 'rgba(235,250,255,0.95)';
+        ctx.lineWidth = 5 * al + 1;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.sz, 0, TAU); ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      } else if (p.type === 'leaf') {
+        ctx.save();
+        ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+        ctx.globalAlpha = al;
+        ctx.fillStyle = p.hue;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, p.sz * 0.65, p.sz * 0.32, 0, 0, TAU);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      } else if (p.type === 'swirl') {
+        ctx.save();
+        ctx.globalAlpha = al * 0.8;
+        ctx.strokeStyle = 'rgba(235,250,255,0.9)';
+        ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+        ctx.beginPath();
+        const a0 = Math.atan2(p.vy, p.vx);
+        ctx.arc(p.x, p.y, p.sz * 0.9, a0, a0 + 2.4);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      } else { // line
+        ctx.save();
+        ctx.globalAlpha = al * 0.7;
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+        const len = p.sz * 1.6, a = Math.atan2(p.vy, p.vx);
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x - Math.cos(a) * len, p.y - Math.sin(a) * len);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      }
+    }
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawButton(r, label, fill, fg) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.beginPath(); roundRect(r.x + 3, r.y + 5, r.w, r.h, 16); ctx.fill();
+    ctx.fillStyle = fill;
+    ctx.beginPath(); roundRect(r.x, r.y, r.w, r.h, 16); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2;
+    ctx.beginPath(); roundRect(r.x, r.y, r.w, r.h, 16); ctx.stroke();
+    ctx.fillStyle = fg; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold 26px "Hiragino Maru Gothic Pro","Yu Gothic",sans-serif';
+    ctx.fillText(label, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.restore();
+  }
+
+  function drawScene() {
+    ctx.clearRect(0, 0, CW, CH);
+    ctx.drawImage(IMG.bg, 0, 0, CW, CH);
+
+    if (scene === 'title') {
+      ctx.save();
+      ctx.fillStyle = 'rgba(10,28,40,0.42)'; ctx.fillRect(0, 0, CW, CH);
+      // decorative turbine + mother
+      const demo = { x: 980, y: 600, h: 300, baseSpin: 2, angle: elapsed * 2, angVel: 2, state: 'spinning', wobble: 0 };
+      drawTurbine(demo);
+      const mw = 250 * (IMG.front.width / IMG.front.height);
+      ctx.drawImage(IMG.front, 360 - mw / 2, 640 - 250, mw, 250);
+
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 64px "Hiragino Maru Gothic Pro","Yu Gothic",sans-serif';
+      ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = 12;
+      ctx.fillText('ぷみのお母さんの', CW / 2, 168);
+      ctx.fillText('風力発電メンテナンス', CW / 2, 244);
+      ctx.shadowBlur = 0;
+      ctx.font = '24px "Hiragino Maru Gothic Pro","Yu Gothic",sans-serif';
+      ctx.fillStyle = '#dff3e0';
+      ctx.fillText('止まった風車をクリックして、お母さんが手を振って直そう！', CW / 2, 330);
+      drawButton(BTN.challenge, 'チャレンジ', '#ff7043', '#fff');
+      drawButton(BTN.relax, 'のんびり', '#4db6ac', '#fff');
+      ctx.fillStyle = '#cfe8d0'; ctx.font = '18px sans-serif';
+      ctx.fillText('チャレンジ：60秒で何台直せるか／のんびり：時間無制限', CW / 2, 576);
+      ctx.restore();
+      return;
+    }
+
+    // playing / result: world
+    const drawables = [];
+    for (const t of turbines) drawables.push({ y: t.y, fn: () => drawTurbine(t) });
+    if (mother) drawables.push({ y: mother.y, fn: drawMother });
+    drawables.sort((a, b) => a.y - b.y);
+    for (const d of drawables) d.fn();
+    drawParticles();
+
+    // HUD
+    drawButton(BTN.back, '← もどる', 'rgba(40,60,70,0.85)', '#fff');
+    drawButton(BTN.mute, muted ? '🔇' : '🔊', 'rgba(40,60,70,0.85)', '#fff');
+
+    const stopped = turbines.filter(t => t.state === 'stopped').length;
+    ctx.save();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath(); roundRect(CW / 2 - 210, 16, 420, 54, 14); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 26px "Hiragino Maru Gothic Pro","Yu Gothic",sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    if (mode === 'challenge') {
+      ctx.fillText('直した: ' + score + '   ⏱ ' + Math.ceil(timeLeft) + '秒   ⚠ ' + stopped, CW / 2, 44);
+    } else {
+      ctx.fillText('直した: ' + score + '   ⚠ 止まってる: ' + stopped, CW / 2, 44);
+    }
+    ctx.restore();
+
+    if (scene === 'result') {
+      ctx.save();
+      ctx.fillStyle = 'rgba(8,20,30,0.6)'; ctx.fillRect(0, 0, CW, CH);
+      ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+      ctx.font = 'bold 56px "Hiragino Maru Gothic Pro","Yu Gothic",sans-serif';
+      ctx.fillText('タイムアップ！', CW / 2, 250);
+      ctx.font = 'bold 40px "Hiragino Maru Gothic Pro","Yu Gothic",sans-serif';
+      ctx.fillStyle = '#ffe082';
+      ctx.fillText('風車を ' + score + ' 台 直したよ！', CW / 2, 350);
+      drawButton(BTN.retry, 'もう一回', '#ff7043', '#fff');
+      drawButton(BTN.toTitle, 'タイトルへ', '#4db6ac', '#fff');
+      ctx.restore();
+    }
+  }
+
+  // ---------- loop ----------
+  let last = 0;
+  function frame(ts) {
+    const dt = last ? Math.min(0.05, (ts - last) / 1000) : 0;
+    last = ts;
+    update(dt);
+    drawScene();
+    requestAnimationFrame(frame);
+  }
+
+  function start() {
+    document.getElementById('loading').style.display = 'none';
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
